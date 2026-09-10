@@ -8,6 +8,9 @@ export interface Rider {
   name: string;
   preferred_language: string;
   phone: string;
+  care_notes?: string;
+  companion_name?: string;
+  companion_phone?: string;
   permissions: Record<string, boolean>;
 }
 
@@ -19,6 +22,18 @@ export interface Dispatcher {
   on_duty: boolean;
 }
 
+export interface EscalationPayload {
+  rider_name?: string;
+  last_known_location?: { lat: number; lon: number } | null;
+  destination?: string;
+  care_notes?: string;
+  companion_name?: string;
+  companion_phone?: string;
+  organization_name?: string;
+  organization_phone?: string;
+  mocked?: boolean;
+}
+
 export interface Trip {
   id: string;
   rider_id: string;
@@ -26,10 +41,13 @@ export interface Trip {
   route_name: string;
   status: string;
   severity: Severity;
+  escort_state?: string;
+  spoken_instruction?: string;
+  companion_notified?: boolean;
   route_shape: [number, number][];
   milestones: { label: string; complete: boolean }[];
   locations?: { lat: number; lon: number; source: string; recorded_at: string }[];
-  rider?: { name: string; preferred_language: string; phone: string };
+  rider?: { name: string; preferred_language: string; phone: string; care_notes?: string; companion_name?: string; companion_phone?: string };
   alerts?: Alert[];
   resolution?: { spoken_confirmation: string };
 }
@@ -42,6 +60,7 @@ export interface Alert {
   severity: Severity;
   status: string;
   assigned_dispatcher_id?: string;
+  companion_notified?: boolean;
   triage: {
     severity: string;
     summary: string;
@@ -50,6 +69,7 @@ export interface Alert {
   };
   rider?: { name: string; phone: string };
   trip?: { destination_name: string; route_name: string };
+  escalation_payload?: EscalationPayload;
 }
 
 export interface Snapshot {
@@ -80,6 +100,7 @@ export const api = {
     request(`/dispatchers/${dispatcherId}/duty`, { method: "POST", body: JSON.stringify({ on_duty: onDuty }) }),
   claimAlert: (alertId: string) => request<Alert>(`/alerts/${alertId}/claim`, { method: "POST" }),
   escalateAlert: (alertId: string) => request<Alert>(`/alerts/${alertId}/escalate`, { method: "POST" }),
+  requestHelp: (tripId: string) => request<Trip>(`/trips/${tripId}/help`, { method: "POST" }),
   runDemo: (scenario: string) => request<Trip>(`/demo/run/${scenario}`, { method: "POST" }),
   resetDemo: () => request("/demo/reset", { method: "POST" }),
 };

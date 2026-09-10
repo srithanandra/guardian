@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-DB_PATH = Path(__file__).resolve().parents[2] / "guardian.db"
+DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "guardian.db"
+
+
+def db_path() -> Path:
+    return Path(os.environ.get("GUARDIAN_DB_PATH", str(DEFAULT_DB_PATH)))
 
 
 def utc_now() -> str:
@@ -16,7 +21,7 @@ def utc_now() -> str:
 
 @contextmanager
 def connect() -> Iterator[sqlite3.Connection]:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(db_path())
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     try:
@@ -123,7 +128,24 @@ def init_db() -> None:
             );
             """
         )
+        ensure_columns(conn)
         seed(conn)
+
+
+def ensure_columns(conn: sqlite3.Connection) -> None:
+    rider_columns = {row[1] for row in conn.execute("PRAGMA table_info(riders)").fetchall()}
+    trip_columns = {row[1] for row in conn.execute("PRAGMA table_info(trips)").fetchall()}
+    additions = [
+        ("riders", rider_columns, "care_notes", "TEXT NOT NULL DEFAULT ''"),
+        ("riders", rider_columns, "companion_name", "TEXT NOT NULL DEFAULT ''"),
+        ("riders", rider_columns, "companion_phone", "TEXT NOT NULL DEFAULT ''"),
+        ("trips", trip_columns, "escort_state", "TEXT NOT NULL DEFAULT 'on_track'"),
+        ("trips", trip_columns, "spoken_instruction", "TEXT NOT NULL DEFAULT ''"),
+        ("trips", trip_columns, "companion_notified", "INTEGER NOT NULL DEFAULT 0"),
+    ]
+    for table, existing, name, spec in additions:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {spec}")
 
 
 def seed(conn: sqlite3.Connection) -> None:
@@ -132,7 +154,10 @@ def seed(conn: sqlite3.Connection) -> None:
         ("org_vacc", "Vietnamese American Community Center", "Westminster, CA", "+17145550111"),
     )
     conn.execute(
-        "INSERT OR IGNORE INTO riders VALUES (?, ?, ?, ?, ?, ?)",
+        """
+        INSERT OR IGNORE INTO riders (id, organization_id, name, preferred_language, phone, permissions_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
         (
             "rider_nguyen",
             "org_vacc",
@@ -140,6 +165,19 @@ def seed(conn: sqlite3.Connection) -> None:
             "vi",
             "+17145550123",
             json.dumps({"location": True, "notifications": True, "microphone": True}),
+        ),
+    )
+    conn.execute(
+        """
+        UPDATE riders
+        SET care_notes = ?, companion_name = ?, companion_phone = ?
+        WHERE id = ?
+        """,
+        (
+            "Elderly rider. Prefers Vietnamese. May become disoriented if the route changes.",
+            "Linh Nguyen",
+            "+17145550100",
+            "rider_nguyen",
         ),
     )
     conn.execute(
@@ -166,6 +204,9 @@ def log_event(trip_id: str | None, alert_id: str | None, event_type: str, payloa
 def hydrate_trip(row: dict) -> dict:
     row["route_shape"] = json.loads(row.pop("route_shape_json"))
     row["milestones"] = json.loads(row.pop("milestones_json"))
+    row["companion_notified"] = bool(row.get("companion_notified"))
+    row["escort_state"] = row.get("escort_state") or "on_track"
+    row["spoken_instruction"] = row.get("spoken_instruction") or ""
     return row
 
 

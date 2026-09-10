@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 
@@ -9,10 +10,24 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from backend.app.agents.escort_scripts import spoken_instruction
 from backend.app.agents.route_compliance import evaluate_route_compliance
 from backend.app.agents.triage import generate_triage
 from backend.app.db import connect, hydrate_alert, hydrate_trip, init_db, row_to_dict, rows_to_dicts, utc_now
-from backend.app.gtfs.static_data import DEMO_ROUTE, ON_ROUTE_TRACE, WRONG_BUS_TRACE, resolve_destination
+from backend.app.gtfs.static_data import (
+    ON_ROUTE_TRACE,
+    WRONG_BUS_TRACE,
+    journey_milestones,
+    remaining_stops,
+    resolve_destination,
+)
+
+TIER_HOLD_SECONDS = float(os.getenv("GUARDIAN_TIER_HOLD_SECONDS", "8"))
+DEMO_PING_SECONDS = float(os.getenv("GUARDIAN_DEMO_PING_SECONDS", "1.2"))
+DEMO_SYNC = os.getenv("GUARDIAN_DEMO_SYNC", "").lower() in {"1", "true", "yes"}
+AUTO_ESCALATE = os.getenv("GUARDIAN_AUTO_ESCALATE", "1").lower() not in {"0", "false", "no"}
+JUDGE_TRACE = ON_ROUTE_TRACE[:3] + WRONG_BUS_TRACE[2:]
+ESCORT_BY_TIER = {1: "tier1_redirect", 2: "tier2_checkin", 3: "tier3_dispatch"}
 
 app = FastAPI(title="Guardian API", version="0.1.0")
 app.add_middleware(
@@ -22,6 +37,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+escalation_tasks: dict[str, asyncio.Task] = {}
+demo_tasks: list[asyncio.Task] = []
 
 
 class CreateTripRequest(BaseModel):
@@ -156,16 +174,20 @@ async def create_trip(request: CreateTripRequest) -> dict:
             raise HTTPException(status_code=409, detail={"message": "Critical permissions missing", "permissions": permissions})
 
         trip_id = f"trip_{uuid.uuid4().hex[:8]}"
-        milestones = [
-            {"label": "Trip confirmed", "complete": True},
-            {"label": f"Board {resolution['route']['name']}", "complete": False},
-            {"label": "Approaching Westminster Clinic", "complete": False},
-            {"label": "Arrived", "complete": False},
-        ]
+        instruction = spoken_instruction(
+            "on_track",
+            rider.get("preferred_language"),
+            destination=resolution["destination"]["name"],
+        )
+        milestones = journey_milestones(resolution["route"]["name"], [])
         now = utc_now()
         conn.execute(
             """
-            INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO trips (
+                id, rider_id, organization_id, destination_name, route_id, route_name,
+                status, severity, route_shape_json, milestones_json, created_at, updated_at,
+                escort_state, spoken_instruction, companion_notified
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 trip_id,
@@ -180,6 +202,9 @@ async def create_trip(request: CreateTripRequest) -> dict:
                 json.dumps(milestones),
                 now,
                 now,
+                "on_track",
+                instruction,
+                0,
             ),
         )
         conn.execute(
@@ -195,8 +220,8 @@ async def create_trip(request: CreateTripRequest) -> dict:
 @app.get("/trips")
 def list_trips() -> list[dict]:
     with connect() as conn:
-        rows = rows_to_dicts(conn.execute("SELECT * FROM trips ORDER BY created_at DESC").fetchall())
-    return [hydrate_trip(row) for row in rows]
+        rows = rows_to_dicts(conn.execute("SELECT id FROM trips ORDER BY created_at DESC").fetchall())
+    return [get_trip(row["id"]) for row in rows]
 
 
 @app.get("/trips/{trip_id}")
@@ -209,12 +234,17 @@ def get_trip(trip_id: str) -> dict:
             conn.execute("SELECT lat, lon, source, recorded_at FROM locations WHERE trip_id = ? ORDER BY id", (trip_id,)).fetchall()
         )
         alerts = rows_to_dicts(conn.execute("SELECT * FROM alerts WHERE trip_id = ? ORDER BY created_at DESC", (trip_id,)).fetchall())
-        rider = row_to_dict(conn.execute("SELECT name, preferred_language, phone FROM riders WHERE id = ?", (trip["rider_id"],)).fetchone())
+        rider = row_to_dict(
+            conn.execute(
+                "SELECT name, preferred_language, phone, care_notes, companion_name, companion_phone FROM riders WHERE id = ?",
+                (trip["rider_id"],),
+            ).fetchone()
+        )
     return {
         **hydrate_trip(trip),
         "rider": rider,
         "locations": locations,
-        "alerts": [hydrate_alert(alert) for alert in alerts],
+        "alerts": [enrich_alert(hydrate_alert(alert)) for alert in alerts],
     }
 
 
@@ -232,11 +262,12 @@ async def add_location(trip_id: str, request: LocationRequest) -> dict:
         locations = rows_to_dicts(
             conn.execute("SELECT lat, lon, source, recorded_at FROM locations WHERE trip_id = ? ORDER BY id", (trip_id,)).fetchall()
         )
+        rider = row_to_dict(conn.execute("SELECT preferred_language FROM riders WHERE id = ?", (trip["rider_id"],)).fetchone())
 
     route_shape = tuple(tuple(point) for point in json.loads(trip["route_shape_json"]))
     compliance = evaluate_route_compliance(locations, route_shape)
-    await update_trip_status(trip_id, compliance)
-    if compliance["deviation_type"]:
+    await apply_location_progress(trip, rider, locations, compliance)
+    if compliance["deviation_type"] and trip.get("escort_state") == "on_track":
         await create_alert_if_needed(trip_id, compliance)
 
     hydrated = get_trip(trip_id)
@@ -245,15 +276,72 @@ async def add_location(trip_id: str, request: LocationRequest) -> dict:
     return {"trip": hydrated, "compliance": compliance}
 
 
-async def update_trip_status(trip_id: str, compliance: dict) -> None:
+@app.post("/trips/{trip_id}/help")
+async def request_help(trip_id: str) -> dict:
+    with connect() as conn:
+        trip = row_to_dict(conn.execute("SELECT * FROM trips WHERE id = ?", (trip_id,)).fetchone())
+        if not trip:
+            raise HTTPException(status_code=404, detail="Trip not found")
+        alert = row_to_dict(
+            conn.execute(
+                "SELECT * FROM alerts WHERE trip_id = ? AND status IN ('open', 'claimed', 'critical') ORDER BY created_at DESC",
+                (trip_id,),
+            ).fetchone()
+        )
+
+    if alert:
+        cancel_escalation(alert["id"])
+        await set_escort_tier(trip_id, alert["id"], 3, help_requested=True)
+    else:
+        compliance = {
+            "status": "critical",
+            "deviation_type": "help_requested",
+            "severity": "red",
+            "message": "Rider pressed Help.",
+            "distance_from_route_m": 0,
+        }
+        alert = await create_alert_if_needed(trip_id, compliance, tier=3, help_requested=True)
+        if alert:
+            cancel_escalation(alert["id"])
+
+    hydrated = get_trip(trip_id)
+    await manager.broadcast("help_requested", hydrated)
+    await manager.broadcast("snapshot", snapshot())
+    return hydrated
+
+
+async def apply_location_progress(trip: dict, rider: dict | None, locations: list[dict], compliance: dict) -> None:
+    latest = locations[-1]
+    point = (float(latest["lat"]), float(latest["lon"]))
+    milestones = journey_milestones(trip["route_name"], locations)
+    arrived = bool(milestones[-1]["complete"])
+    escort_state = trip.get("escort_state") or "on_track"
+    instruction = trip.get("spoken_instruction") or ""
+    if escort_state == "on_track":
+        instruction = spoken_instruction(
+            "on_track",
+            (rider or {}).get("preferred_language"),
+            destination=trip["destination_name"],
+            stops_remaining=remaining_stops(point),
+            arrived=arrived,
+        )
     with connect() as conn:
         conn.execute(
-            "UPDATE trips SET status = ?, severity = ?, updated_at = ? WHERE id = ?",
-            (compliance["status"], compliance["severity"], utc_now(), trip_id),
+            """
+            UPDATE trips
+            SET status = ?, severity = ?, milestones_json = ?, spoken_instruction = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (compliance["status"], compliance["severity"], json.dumps(milestones), instruction, utc_now(), trip["id"]),
         )
 
 
-async def create_alert_if_needed(trip_id: str, compliance: dict) -> None:
+async def create_alert_if_needed(
+    trip_id: str,
+    compliance: dict,
+    tier: int = 1,
+    help_requested: bool = False,
+) -> dict | None:
     with connect() as conn:
         existing = row_to_dict(
             conn.execute(
@@ -262,14 +350,17 @@ async def create_alert_if_needed(trip_id: str, compliance: dict) -> None:
             ).fetchone()
         )
         if existing:
-            return
+            return hydrate_alert(existing)
         trip = row_to_dict(conn.execute("SELECT * FROM trips WHERE id = ?", (trip_id,)).fetchone())
-        rider = row_to_dict(conn.execute("SELECT name, phone FROM riders WHERE id = ?", (trip["rider_id"],)).fetchone())
+        rider = row_to_dict(conn.execute("SELECT * FROM riders WHERE id = ?", (trip["rider_id"],)).fetchone())
         dispatcher = row_to_dict(
             conn.execute(
                 "SELECT id FROM dispatchers WHERE organization_id = ? AND on_duty = 1 ORDER BY name LIMIT 1",
                 (trip["organization_id"],),
             ).fetchone()
+        )
+        locations = rows_to_dicts(
+            conn.execute("SELECT lat, lon, source, recorded_at FROM locations WHERE trip_id = ? ORDER BY id", (trip_id,)).fetchall()
         )
         event = {
             "rider_name": rider["name"],
@@ -281,6 +372,15 @@ async def create_alert_if_needed(trip_id: str, compliance: dict) -> None:
         triage = generate_triage(event)
         alert_id = f"alert_{uuid.uuid4().hex[:8]}"
         now = utc_now()
+        escort_state = ESCORT_BY_TIER[tier]
+        instruction = spoken_instruction(
+            escort_state,
+            rider.get("preferred_language"),
+            destination=trip["destination_name"],
+            help_requested=help_requested,
+        )
+        status = "critical" if tier >= 3 else "open"
+        severity = "red" if tier >= 2 or compliance.get("severity") == "red" else compliance.get("severity", "yellow")
         conn.execute(
             """
             INSERT INTO alerts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -290,9 +390,9 @@ async def create_alert_if_needed(trip_id: str, compliance: dict) -> None:
                 trip_id,
                 trip["organization_id"],
                 compliance["deviation_type"],
-                1,
-                compliance["severity"],
-                "open",
+                tier,
+                severity,
+                status,
                 dispatcher["id"] if dispatcher else None,
                 json.dumps(triage),
                 now,
@@ -300,16 +400,150 @@ async def create_alert_if_needed(trip_id: str, compliance: dict) -> None:
             ),
         )
         conn.execute(
-            "INSERT INTO events (trip_id, alert_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
-            (trip_id, alert_id, "alert_created", json.dumps(event), now),
+            """
+            UPDATE trips
+            SET escort_state = ?, spoken_instruction = ?, companion_notified = ?, status = ?, severity = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (escort_state, instruction, 1 if tier >= 2 else 0, compliance.get("status", "deviating"), severity, now, trip_id),
         )
-    asyncio.create_task(escalate_later(alert_id))
-    await manager.broadcast("alert_created", get_alert(alert_id))
+        org = row_to_dict(conn.execute("SELECT name, emergency_phone FROM organizations WHERE id = ?", (trip["organization_id"],)).fetchone())
+        payload = build_payload(trip, rider, locations, org)
+        conn.execute(
+            "INSERT INTO events (trip_id, alert_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            (trip_id, alert_id, "alert_created", json.dumps({**event, "tier": tier, **payload}), now),
+        )
+        if tier >= 2:
+            conn.execute(
+                "INSERT INTO events (trip_id, alert_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    trip_id,
+                    alert_id,
+                    "companion_notified",
+                    json.dumps({"companion_name": rider.get("companion_name"), "companion_phone": rider.get("companion_phone"), "mocked": True}),
+                    now,
+                ),
+            )
+    created = get_alert(alert_id)
+    await manager.broadcast("alert_created", created)
+    if tier < 3 and AUTO_ESCALATE:
+        schedule_escalation(alert_id)
+    return created
 
 
-async def escalate_later(alert_id: str) -> None:
-    await asyncio.sleep(180)
-    await escalate_alert(alert_id)
+def cancel_escalation(alert_id: str) -> None:
+    task = escalation_tasks.pop(alert_id, None)
+    if task:
+        task.cancel()
+
+
+def cancel_all_background() -> None:
+    for alert_id in list(escalation_tasks):
+        cancel_escalation(alert_id)
+    for task in demo_tasks:
+        task.cancel()
+    demo_tasks.clear()
+
+
+def schedule_escalation(alert_id: str) -> None:
+    cancel_escalation(alert_id)
+    escalation_tasks[alert_id] = asyncio.create_task(_auto_escalate(alert_id))
+
+
+async def _auto_escalate(alert_id: str) -> None:
+    try:
+        await asyncio.sleep(TIER_HOLD_SECONDS)
+        updated = await escalate_alert(alert_id)
+        if updated and updated.get("status") != "claimed" and int(updated.get("tier") or 3) < 3:
+            schedule_escalation(alert_id)
+    except asyncio.CancelledError:
+        return
+
+
+async def set_escort_tier(trip_id: str, alert_id: str, tier: int, help_requested: bool = False) -> dict:
+    with connect() as conn:
+        trip = row_to_dict(conn.execute("SELECT * FROM trips WHERE id = ?", (trip_id,)).fetchone())
+        rider = row_to_dict(conn.execute("SELECT * FROM riders WHERE id = ?", (trip["rider_id"],)).fetchone())
+        locations = rows_to_dicts(
+            conn.execute("SELECT lat, lon, source, recorded_at FROM locations WHERE trip_id = ? ORDER BY id", (trip_id,)).fetchall()
+        )
+        escort_state = ESCORT_BY_TIER[tier]
+        instruction = spoken_instruction(
+            escort_state,
+            rider.get("preferred_language"),
+            destination=trip["destination_name"],
+            help_requested=help_requested,
+        )
+        now = utc_now()
+        status = "critical" if tier >= 3 else "open"
+        severity = "red" if tier >= 2 else "yellow"
+        notify = 1 if tier >= 2 or help_requested else 0
+        conn.execute(
+            "UPDATE alerts SET tier = ?, status = ?, severity = ?, assigned_dispatcher_id = NULL, updated_at = ? WHERE id = ?",
+            (tier, status, severity, now, alert_id),
+        )
+        conn.execute(
+            """
+            UPDATE trips
+            SET escort_state = ?, spoken_instruction = ?, companion_notified = ?, status = ?, severity = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (escort_state, instruction, notify, "critical" if tier >= 3 else "deviating", severity, now, trip_id),
+        )
+        org = row_to_dict(conn.execute("SELECT name, emergency_phone FROM organizations WHERE id = ?", (trip["organization_id"],)).fetchone())
+        event_type = "help_requested" if help_requested else "alert_escalated"
+        conn.execute(
+            "INSERT INTO events (trip_id, alert_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            (trip_id, alert_id, event_type, json.dumps({"tier": tier, **build_payload(trip, rider, locations, org)}), now),
+        )
+        if notify and not trip.get("companion_notified"):
+            conn.execute(
+                "INSERT INTO events (trip_id, alert_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    trip_id,
+                    alert_id,
+                    "companion_notified",
+                    json.dumps({"companion_name": rider.get("companion_name"), "companion_phone": rider.get("companion_phone"), "mocked": True}),
+                    now,
+                ),
+            )
+    return get_alert(alert_id)
+
+
+def build_payload(trip: dict, rider: dict, locations: list[dict], org: dict | None = None) -> dict:
+    latest = locations[-1] if locations else None
+    return {
+        "rider_name": rider.get("name"),
+        "last_known_location": {"lat": latest["lat"], "lon": latest["lon"]} if latest else None,
+        "destination": trip.get("destination_name"),
+        "care_notes": rider.get("care_notes") or "",
+        "companion_name": rider.get("companion_name") or "",
+        "companion_phone": rider.get("companion_phone") or "",
+        "organization_name": (org or {}).get("name"),
+        "organization_phone": (org or {}).get("emergency_phone"),
+        "mocked": True,
+    }
+
+
+def enrich_alert(alert: dict) -> dict:
+    with connect() as conn:
+        trip = row_to_dict(conn.execute("SELECT * FROM trips WHERE id = ?", (alert["trip_id"],)).fetchone())
+        if not trip:
+            return alert
+        rider = row_to_dict(conn.execute("SELECT * FROM riders WHERE id = ?", (trip["rider_id"],)).fetchone())
+        locations = rows_to_dicts(
+            conn.execute("SELECT lat, lon, source, recorded_at FROM locations WHERE trip_id = ? ORDER BY id", (alert["trip_id"],)).fetchall()
+        )
+        org = row_to_dict(conn.execute("SELECT name, emergency_phone FROM organizations WHERE id = ?", (trip["organization_id"],)).fetchone())
+    payload = build_payload(trip, rider or {}, locations, org)
+    return {
+        **alert,
+        "trip": {"destination_name": trip["destination_name"], "route_name": trip["route_name"]},
+        "rider": {"name": (rider or {}).get("name"), "phone": (rider or {}).get("phone")},
+        "organization": org,
+        "companion_notified": bool(trip.get("companion_notified")),
+        "escalation_payload": payload,
+    }
 
 
 @app.post("/alerts/{alert_id}/claim")
@@ -330,6 +564,7 @@ async def claim_alert(alert_id: str, dispatcher_id: str = "dispatcher_lan") -> d
             "INSERT INTO events (trip_id, alert_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
             (alert["trip_id"], alert_id, "alert_claimed", json.dumps({"dispatcher_id": dispatcher_id}), now),
         )
+    cancel_escalation(alert_id)
     updated = get_alert(alert_id)
     await manager.broadcast("alert_claimed", updated)
     await manager.broadcast("snapshot", snapshot())
@@ -340,7 +575,7 @@ async def claim_alert(alert_id: str, dispatcher_id: str = "dispatcher_lan") -> d
 def list_alerts() -> list[dict]:
     with connect() as conn:
         rows = rows_to_dicts(conn.execute("SELECT * FROM alerts ORDER BY created_at DESC").fetchall())
-    return [hydrate_alert(row) for row in rows]
+    return [enrich_alert(hydrate_alert(row)) for row in rows]
 
 
 @app.get("/alerts/{alert_id}")
@@ -349,35 +584,21 @@ def get_alert(alert_id: str) -> dict:
         alert = row_to_dict(conn.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone())
         if not alert:
             raise HTTPException(status_code=404, detail="Alert not found")
-        trip = row_to_dict(conn.execute("SELECT destination_name, route_name FROM trips WHERE id = ?", (alert["trip_id"],)).fetchone())
-        rider = row_to_dict(
-            conn.execute(
-                "SELECT riders.name, riders.phone FROM riders JOIN trips ON trips.rider_id = riders.id WHERE trips.id = ?",
-                (alert["trip_id"],),
-            ).fetchone()
-        )
-    return {**hydrate_alert(alert), "trip": trip, "rider": rider}
+    return enrich_alert(hydrate_alert(alert))
 
 
 @app.post("/alerts/{alert_id}/escalate")
 async def escalate_alert(alert_id: str) -> dict:
     with connect() as conn:
         alert = row_to_dict(conn.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone())
-        if not alert or alert["status"] == "claimed":
-            return alert or {}
+        if not alert:
+            return {}
+        if alert["status"] == "claimed":
+            return get_alert(alert_id)
         next_tier = min(int(alert["tier"]) + 1, 3)
-        status = "critical" if next_tier == 3 else "open"
-        severity = "red" if next_tier >= 2 else alert["severity"]
-        now = utc_now()
-        conn.execute(
-            "UPDATE alerts SET tier = ?, status = ?, severity = ?, assigned_dispatcher_id = NULL, updated_at = ? WHERE id = ?",
-            (next_tier, status, severity, now, alert_id),
-        )
-        conn.execute(
-            "INSERT INTO events (trip_id, alert_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
-            (alert["trip_id"], alert_id, "alert_escalated", json.dumps({"tier": next_tier}), now),
-        )
-    updated = get_alert(alert_id)
+        if next_tier == int(alert["tier"]):
+            return get_alert(alert_id)
+    updated = await set_escort_tier(alert["trip_id"], alert_id, next_tier)
     await manager.broadcast("alert_escalated", updated)
     await manager.broadcast("snapshot", snapshot())
     return updated
@@ -385,6 +606,7 @@ async def escalate_alert(alert_id: str) -> dict:
 
 @app.post("/demo/reset")
 async def reset_demo() -> dict:
+    cancel_all_background()
     with connect() as conn:
         conn.execute("DELETE FROM events")
         conn.execute("DELETE FROM alerts")
@@ -397,8 +619,32 @@ async def reset_demo() -> dict:
 
 @app.post("/demo/run/{scenario}")
 async def run_demo_scenario(scenario: str = "wrong-bus") -> dict:
-    trip = await create_trip(CreateTripRequest())
-    trace = WRONG_BUS_TRACE if scenario == "wrong-bus" else ON_ROUTE_TRACE
+    trip_id = active_trip_id()
+    if not trip_id:
+        created = await create_trip(CreateTripRequest(mode=f"demo:{scenario}"))
+        trip_id = created["id"]
+    if DEMO_SYNC:
+        await play_demo_script(trip_id, scenario)
+    else:
+        task = asyncio.create_task(play_demo_script(trip_id, scenario))
+        demo_tasks.append(task)
+    return get_trip(trip_id)
+
+
+def active_trip_id() -> str | None:
+    with connect() as conn:
+        row = row_to_dict(conn.execute("SELECT id FROM trips ORDER BY created_at DESC LIMIT 1").fetchone())
+    return row["id"] if row else None
+
+
+async def play_demo_script(trip_id: str, scenario: str) -> None:
+    if scenario in {"wrong-bus", "judge", "full-script"}:
+        trace = JUDGE_TRACE
+        source = "demo:judge"
+    else:
+        trace = ON_ROUTE_TRACE
+        source = f"demo:{scenario}"
     for lat, lon in trace:
-        await add_location(trip["id"], LocationRequest(lat=lat, lon=lon, source=f"demo:{scenario}"))
-    return get_trip(trip["id"])
+        await add_location(trip_id, LocationRequest(lat=lat, lon=lon, source=source))
+        if DEMO_PING_SECONDS:
+            await asyncio.sleep(DEMO_PING_SECONDS)

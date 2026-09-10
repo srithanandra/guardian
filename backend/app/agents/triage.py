@@ -29,6 +29,13 @@ def _fallback_triage(event: dict) -> dict:
             "recommended_action": "Call the rider to confirm they are safe and still waiting intentionally.",
             "rider_phrase": "Please wait. A Guardian volunteer may call you.",
         }
+    if deviation_type == "help requested":
+        return {
+            "severity": "critical",
+            "summary": f"{rider_name} pressed Help while traveling to {destination}.",
+            "recommended_action": "Call the rider now and stay on the line until they are safe.",
+            "rider_phrase": "Help is on the way. Stay where you are.",
+        }
     return {
         **CACHED_TRIAGE,
         "summary": f"{rider_name} is {readable_deviation} while traveling to {destination}. They may need immediate guidance.",

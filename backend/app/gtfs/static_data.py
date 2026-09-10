@@ -106,6 +106,29 @@ def destination_candidates(query: str, limit: int = 3) -> list[dict]:
     return sorted(candidates, key=lambda item: item["score"], reverse=True)[:limit]
 
 
+def remaining_stops(point: tuple[float, float]) -> int:
+    distances = [haversine_meters(point, route_point) for route_point in DEMO_ROUTE.shape]
+    index = min(range(len(distances)), key=distances.__getitem__)
+    return max(len(DEMO_ROUTE.shape) - 1 - index, 0)
+
+
+def journey_milestones(route_name: str, locations: list[dict], destination: Stop = WESTMINSTER_CLINIC) -> list[dict]:
+    boarded = len(locations) >= 1
+    approaching = False
+    arrived = False
+    if locations:
+        latest = locations[-1]
+        distance = haversine_meters((float(latest["lat"]), float(latest["lon"])), (destination.lat, destination.lon))
+        approaching = distance < 800
+        arrived = distance < 80
+    return [
+        {"label": "Trip confirmed", "complete": True},
+        {"label": f"Board {route_name}", "complete": boarded},
+        {"label": f"Approaching {destination.name}", "complete": approaching},
+        {"label": "Arrived", "complete": arrived},
+    ]
+
+
 def resolve_destination(query: str) -> dict:
     candidates = destination_candidates(query)
     best = candidates[0] if candidates else {

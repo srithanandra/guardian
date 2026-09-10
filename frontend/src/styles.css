@@ -70,6 +70,11 @@ input {
   color: #991b1b;
 }
 
+.warn {
+  background: #fef3c7;
+  color: #92400e;
+}
+
 .content,
 .dashboard-grid,
 .rider-shell {
@@ -89,6 +94,11 @@ input {
   display: grid;
   gap: 22px;
   grid-template-columns: minmax(300px, 560px) 1fr;
+}
+
+.rider-shell.live {
+  grid-template-columns: 1fr;
+  max-width: 640px;
 }
 
 .column {
@@ -143,7 +153,8 @@ input {
   text-transform: uppercase;
 }
 
-.voice-button {
+.voice-button,
+.help-button {
   align-items: center;
   background: #2563eb;
   border-radius: 28px;
@@ -153,6 +164,49 @@ input {
   height: 220px;
   justify-content: center;
   width: 100%;
+}
+
+.help-button {
+  background: #dc2626;
+  font-size: 1.8rem;
+  height: 240px;
+}
+
+.escort-card {
+  min-height: 520px;
+  justify-content: space-between;
+}
+
+.escort-sentence {
+  font-size: 1.7rem;
+  font-weight: 700;
+  line-height: 1.25;
+  margin: 0;
+}
+
+.payload-list {
+  background: #f8fafc;
+  border-radius: 14px;
+  display: grid;
+  gap: 8px;
+  margin: 12px 0;
+  padding: 12px;
+}
+
+.payload-list div {
+  display: grid;
+  gap: 2px;
+}
+
+.payload-list dt {
+  color: #64748b;
+  font-size: 0.75rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.payload-list dd {
+  margin: 0;
 }
 
 .pulse {
