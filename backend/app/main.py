@@ -6,13 +6,16 @@ import os
 import uuid
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from backend.app.agents.escort_scripts import spoken_instruction
+from backend.app.agents.escort_scripts import generate_guidance, interpret_rider_reply, spoken_instruction
 from backend.app.agents.route_compliance import evaluate_route_compliance
 from backend.app.agents.triage import generate_triage
+from backend.app.agents.tts import synthesize_speech, tts_provider
 from backend.app.db import connect, hydrate_alert, hydrate_trip, init_db, row_to_dict, rows_to_dicts, utc_now
 from backend.app.gtfs.static_data import (
     ON_ROUTE_TRACE,
@@ -20,7 +23,10 @@ from backend.app.gtfs.static_data import (
     journey_milestones,
     remaining_stops,
     resolve_destination,
+    upcoming_stop,
 )
+
+load_dotenv()
 
 TIER_HOLD_SECONDS = float(os.getenv("GUARDIAN_TIER_HOLD_SECONDS", "8"))
 DEMO_PING_SECONDS = float(os.getenv("GUARDIAN_DEMO_PING_SECONDS", "1.2"))
@@ -29,7 +35,7 @@ AUTO_ESCALATE = os.getenv("GUARDIAN_AUTO_ESCALATE", "1").lower() not in {"0", "f
 JUDGE_TRACE = ON_ROUTE_TRACE[:3] + WRONG_BUS_TRACE[2:]
 ESCORT_BY_TIER = {1: "tier1_redirect", 2: "tier2_checkin", 3: "tier3_dispatch"}
 
-app = FastAPI(title="Guardian API", version="0.1.0")
+app = FastAPI(title="Guardian API", version="0.1.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -65,6 +71,19 @@ class PermissionRequest(BaseModel):
     microphone: bool = Field(default=True)
 
 
+class ReplyRequest(BaseModel):
+    transcript: str
+
+
+class LanguageRequest(BaseModel):
+    preferred_language: str
+
+
+class TtsRequest(BaseModel):
+    text: str
+    language: str = "en-US"
+
+
 class ConnectionManager:
     def __init__(self) -> None:
         self.active: set[WebSocket] = set()
@@ -97,7 +116,15 @@ async def startup() -> None:
 
 @app.get("/health")
 def health() -> dict:
-    return {"ok": True, "service": "guardian-api"}
+    return {"ok": True, "service": "guardian-api", "tts": tts_provider()}
+
+
+@app.post("/tts")
+def synthesize_voice(request: TtsRequest):
+    audio = synthesize_speech(request.text, request.language)
+    if not audio:
+        raise HTTPException(status_code=503, detail="Neural TTS is not configured")
+    return Response(content=audio, media_type="audio/mpeg")
 
 
 @app.websocket("/ws")
@@ -142,6 +169,32 @@ async def update_permissions(rider_id: str, request: PermissionRequest) -> dict:
     return {"rider_id": rider_id, "permissions": permissions, "ready": all(permissions.values())}
 
 
+@app.patch("/riders/{rider_id}/language")
+async def update_language(rider_id: str, request: LanguageRequest) -> dict:
+    language = "vi" if request.preferred_language.lower().startswith("vi") else "en"
+    with connect() as conn:
+        rider = row_to_dict(conn.execute("SELECT * FROM riders WHERE id = ?", (rider_id,)).fetchone())
+        if not rider:
+            raise HTTPException(status_code=404, detail="Rider not found")
+        conn.execute("UPDATE riders SET preferred_language = ? WHERE id = ?", (language, rider_id))
+        trip = row_to_dict(conn.execute("SELECT * FROM trips ORDER BY created_at DESC LIMIT 1").fetchone())
+        locations: list[dict] = []
+        if trip:
+            locations = rows_to_dicts(
+                conn.execute("SELECT lat, lon, source, recorded_at FROM locations WHERE trip_id = ? ORDER BY id", (trip["id"],)).fetchall()
+            )
+    rider = {**rider, "preferred_language": language}
+    if trip:
+        instruction = render_guidance(trip, rider, locations, escort_state=trip.get("escort_state"))
+        with connect() as conn:
+            conn.execute(
+                "UPDATE trips SET spoken_instruction = ?, updated_at = ? WHERE id = ?",
+                (instruction, utc_now(), trip["id"]),
+            )
+    await manager.broadcast("snapshot", snapshot())
+    return {"rider_id": rider_id, "preferred_language": language, "trip": get_trip(trip["id"]) if trip else None}
+
+
 @app.get("/dispatchers")
 def list_dispatchers() -> list[dict]:
     with connect() as conn:
@@ -174,10 +227,13 @@ async def create_trip(request: CreateTripRequest) -> dict:
             raise HTTPException(status_code=409, detail={"message": "Critical permissions missing", "permissions": permissions})
 
         trip_id = f"trip_{uuid.uuid4().hex[:8]}"
-        instruction = spoken_instruction(
-            "on_track",
-            rider.get("preferred_language"),
-            destination=resolution["destination"]["name"],
+        instruction = render_guidance(
+            {
+                "destination_name": resolution["destination"]["name"],
+                "route_name": resolution["route"]["name"],
+                "escort_state": "on_track",
+            },
+            rider,
         )
         milestones = journey_milestones(resolution["route"]["name"], [])
         now = utc_now()
@@ -186,8 +242,8 @@ async def create_trip(request: CreateTripRequest) -> dict:
             INSERT INTO trips (
                 id, rider_id, organization_id, destination_name, route_id, route_name,
                 status, severity, route_shape_json, milestones_json, created_at, updated_at,
-                escort_state, spoken_instruction, companion_notified
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                escort_state, spoken_instruction, companion_notified, last_reply_intent
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 trip_id,
@@ -205,6 +261,7 @@ async def create_trip(request: CreateTripRequest) -> dict:
                 "on_track",
                 instruction,
                 0,
+                "",
             ),
         )
         conn.execute(
@@ -310,6 +367,103 @@ async def request_help(trip_id: str) -> dict:
     return hydrated
 
 
+@app.post("/trips/{trip_id}/reply")
+async def reply_to_escort(trip_id: str, request: ReplyRequest) -> dict:
+    with connect() as conn:
+        trip = row_to_dict(conn.execute("SELECT * FROM trips WHERE id = ?", (trip_id,)).fetchone())
+        if not trip:
+            raise HTTPException(status_code=404, detail="Trip not found")
+        rider = row_to_dict(conn.execute("SELECT * FROM riders WHERE id = ?", (trip["rider_id"],)).fetchone())
+        locations = rows_to_dicts(
+            conn.execute("SELECT lat, lon, source, recorded_at FROM locations WHERE trip_id = ? ORDER BY id", (trip_id,)).fetchall()
+        )
+        alert = row_to_dict(
+            conn.execute(
+                "SELECT * FROM alerts WHERE trip_id = ? AND status IN ('open', 'claimed', 'critical') ORDER BY created_at DESC",
+                (trip_id,),
+            ).fetchone()
+        )
+
+    interpretation = interpret_rider_reply(request.transcript, rider.get("preferred_language"))
+    intent = interpretation["intent"]
+    escort_state = trip.get("escort_state") or "on_track"
+
+    if intent == "needs_help":
+        hydrated = await request_help(trip_id)
+        return {"trip": hydrated, "interpretation": interpretation}
+
+    if intent == "confused" and escort_state == "on_track":
+        await create_alert_if_needed(
+            trip_id,
+            {
+                "status": "deviating",
+                "deviation_type": "confused",
+                "severity": "yellow",
+                "message": "Rider said they are lost or confused.",
+                "distance_from_route_m": 0,
+            },
+            tier=1,
+        )
+        with connect() as conn:
+            conn.execute(
+                "UPDATE trips SET last_reply_intent = ?, updated_at = ? WHERE id = ?",
+                (intent, utc_now(), trip_id),
+            )
+            conn.execute(
+                "INSERT INTO events (trip_id, alert_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                (trip_id, None, "rider_reply", json.dumps(interpretation), utc_now()),
+            )
+        hydrated = get_trip(trip_id)
+        await manager.broadcast("rider_reply", {"trip": hydrated, "interpretation": interpretation})
+        await manager.broadcast("snapshot", snapshot())
+        return {"trip": hydrated, "interpretation": interpretation}
+
+    if intent == "ok" and escort_state == "tier2_checkin" and alert:
+        cancel_escalation(alert["id"])
+
+    instruction = render_guidance(trip, rider, locations, escort_state=escort_state, intent=intent)
+    with connect() as conn:
+        conn.execute(
+            "UPDATE trips SET spoken_instruction = ?, last_reply_intent = ?, updated_at = ? WHERE id = ?",
+            (instruction, intent, utc_now(), trip_id),
+        )
+        conn.execute(
+            "INSERT INTO events (trip_id, alert_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            (trip_id, alert["id"] if alert else None, "rider_reply", json.dumps(interpretation), utc_now()),
+        )
+    hydrated = get_trip(trip_id)
+    await manager.broadcast("rider_reply", {"trip": hydrated, "interpretation": interpretation})
+    await manager.broadcast("snapshot", snapshot())
+    return {"trip": hydrated, "interpretation": interpretation}
+
+
+def render_guidance(
+    trip: dict,
+    rider: dict | None,
+    locations: list[dict] | None = None,
+    escort_state: str | None = None,
+    help_requested: bool = False,
+    intent: str | None = None,
+) -> str:
+    locations = locations or []
+    point = (float(locations[-1]["lat"]), float(locations[-1]["lon"])) if locations else None
+    arrived = False
+    if locations:
+        arrived = journey_milestones(trip["route_name"], locations)[-1]["complete"]
+    return generate_guidance(
+        {
+            "escort_state": escort_state or trip.get("escort_state") or "on_track",
+            "preferred_language": (rider or {}).get("preferred_language"),
+            "destination": trip.get("destination_name"),
+            "stops_remaining": remaining_stops(point) if point else None,
+            "arrived": arrived,
+            "help_requested": help_requested,
+            "intent": intent,
+            "next_stop": upcoming_stop(point).name,
+        }
+    )
+
+
 async def apply_location_progress(trip: dict, rider: dict | None, locations: list[dict], compliance: dict) -> None:
     latest = locations[-1]
     point = (float(latest["lat"]), float(latest["lon"]))
@@ -373,12 +527,7 @@ async def create_alert_if_needed(
         alert_id = f"alert_{uuid.uuid4().hex[:8]}"
         now = utc_now()
         escort_state = ESCORT_BY_TIER[tier]
-        instruction = spoken_instruction(
-            escort_state,
-            rider.get("preferred_language"),
-            destination=trip["destination_name"],
-            help_requested=help_requested,
-        )
+        instruction = render_guidance(trip, rider, locations, escort_state=escort_state, help_requested=help_requested)
         status = "critical" if tier >= 3 else "open"
         severity = "red" if tier >= 2 or compliance.get("severity") == "red" else compliance.get("severity", "yellow")
         conn.execute(
@@ -468,12 +617,7 @@ async def set_escort_tier(trip_id: str, alert_id: str, tier: int, help_requested
             conn.execute("SELECT lat, lon, source, recorded_at FROM locations WHERE trip_id = ? ORDER BY id", (trip_id,)).fetchall()
         )
         escort_state = ESCORT_BY_TIER[tier]
-        instruction = spoken_instruction(
-            escort_state,
-            rider.get("preferred_language"),
-            destination=trip["destination_name"],
-            help_requested=help_requested,
-        )
+        instruction = render_guidance(trip, rider, locations, escort_state=escort_state, help_requested=help_requested)
         now = utc_now()
         status = "critical" if tier >= 3 else "open"
         severity = "red" if tier >= 2 else "yellow"

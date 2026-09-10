@@ -148,5 +148,15 @@ def resolve_destination(query: str) -> dict:
             "stops": [stop.__dict__ for stop in DEMO_ROUTE.stops],
             "shape": DEMO_ROUTE.shape,
         },
-        "spoken_confirmation": f"You will take {DEMO_ROUTE.name}. The bus leaves soon from your current stop.",
+        "spoken_confirmation": f"Sit down. The bus will take you to {best['name']}.",
     }
+
+
+def upcoming_stop(point: tuple[float, float] | None) -> Stop:
+    if point is None:
+        return DEMO_ROUTE.stops[1] if len(DEMO_ROUTE.stops) > 1 else DEMO_ROUTE.stops[0]
+    left = remaining_stops(point)
+    if left <= 0:
+        return DEMO_ROUTE.stops[-1]
+    index = min(len(DEMO_ROUTE.stops) - 1, max(1, len(DEMO_ROUTE.stops) - left))
+    return DEMO_ROUTE.stops[index]

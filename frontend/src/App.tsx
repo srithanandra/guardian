@@ -2,6 +2,7 @@ import { ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Bell, CheckCircle2, MapPin, Mic, Phone, PhoneCall, Play, Radio, Shield, Users } from "lucide-react";
 import { MapContainer, Marker, Polyline, TileLayer } from "react-leaflet";
 import { Alert, api, Dispatcher, EscalationPayload, Snapshot, Trip, WS_BASE } from "./api";
+import { speak, stopSpeech, unlockSpeech } from "./speech";
 
 const initialSnapshot: Snapshot = { riders: [], dispatchers: [], trips: [], alerts: [] };
 
@@ -20,7 +21,15 @@ export function App() {
         api.snapshot().then(setSnapshot).catch(() => undefined);
       }
     };
-    return () => socket.close();
+    const unlock = () => {
+      unlockSpeech();
+      window.removeEventListener("pointerdown", unlock);
+    };
+    window.addEventListener("pointerdown", unlock);
+    return () => {
+      socket.close();
+      window.removeEventListener("pointerdown", unlock);
+    };
   }, []);
 
   const path = window.location.pathname;
@@ -84,26 +93,46 @@ function RiderInterface({ snapshot, refresh }: { snapshot: Snapshot; refresh: (s
     if (!trip) return;
     const updated = await api.requestHelp(trip.id);
     lastSpoken.current = updated.spoken_instruction ?? lastSpoken.current;
-    speak(updated.spoken_instruction ?? "Help is on the way. Stay where you are.", speechLang(rider?.preferred_language));
+    speak(updated.spoken_instruction ?? "Stay where you are. A person is coming to help.", speechLang(rider?.preferred_language));
     refresh(await api.snapshot());
   }
 
-  function listenForDestination() {
+  async function switchLanguage(language: string) {
+    lastSpoken.current = "";
+    await api.setLanguage(language);
+    refresh(await api.snapshot());
+  }
+
+  function listen(onResult: (transcript: string) => void) {
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SpeechRecognition) {
       setMessage("Voice input is not available in this browser. Type the destination instead.");
       return;
     }
+    stopSpeech();
     const recognition = new SpeechRecognition();
     recognition.lang = speechLang(rider?.preferred_language);
     recognition.onstart = () => setListening(true);
     recognition.onend = () => setListening(false);
-    recognition.onresult = (event: any) => {
-      const transcript = event.results[0][0].transcript;
+    recognition.onresult = (event: any) => onResult(event.results[0][0].transcript);
+    recognition.start();
+  }
+
+  function listenForDestination() {
+    listen((transcript) => {
       setDestination(transcript);
       setMessage(`Heard: ${transcript}`);
-    };
-    recognition.start();
+    });
+  }
+
+  async function listenForReply() {
+    if (!trip) return;
+    listen(async (transcript) => {
+      const result = await api.replyToTrip(trip.id, transcript);
+      lastSpoken.current = result.trip.spoken_instruction ?? lastSpoken.current;
+      speak(result.trip.spoken_instruction ?? "", speechLang(rider?.preferred_language));
+      refresh(await api.snapshot());
+    });
   }
 
   async function togglePermission(key: string, enabled: boolean) {
@@ -137,10 +166,14 @@ function RiderInterface({ snapshot, refresh }: { snapshot: Snapshot; refresh: (s
   if (trip) {
     const arrived = trip.milestones.some((milestone) => milestone.label === "Arrived" && milestone.complete);
     const showHelp = !(arrived && trip.escort_state === "on_track");
+    const checkIn = trip.escort_state === "tier2_checkin";
     return (
       <section className="rider-shell live">
         <div className="hero-card escort-card">
-          <p className="eyebrow">Guardian is with you</p>
+          <div className="row between">
+            <p className="eyebrow">Guardian is with you</p>
+            <LanguageToggle current={rider?.preferred_language} onChange={switchLanguage} />
+          </div>
           <p className="escort-sentence">{trip.spoken_instruction || "Stay seated. Guardian is watching."}</p>
           {showHelp ? (
             <button className="help-button" onClick={callHelp}>
@@ -150,6 +183,12 @@ function RiderInterface({ snapshot, refresh }: { snapshot: Snapshot; refresh: (s
           ) : (
             <p className="muted">Trip complete.</p>
           )}
+          {showHelp ? (
+            <button className={`answer-button ${listening ? "pulse" : ""} ${checkIn ? "emphasis" : ""}`} onClick={listenForReply}>
+              <Mic size={28} />
+              {checkIn ? "Answer check-in" : "Speak to Guardian"}
+            </button>
+          ) : null}
         </div>
       </section>
     );
@@ -158,7 +197,10 @@ function RiderInterface({ snapshot, refresh }: { snapshot: Snapshot; refresh: (s
   return (
     <section className="rider-shell">
       <div className="hero-card">
-        <p className="eyebrow">Rider Mode</p>
+        <div className="row between">
+          <p className="eyebrow">Rider Mode</p>
+          <LanguageToggle current={rider?.preferred_language} onChange={switchLanguage} />
+        </div>
         <h1>Hello {rider?.name ?? "rider"}</h1>
         <p>{message}</p>
         <button className={`voice-button ${listening ? "pulse" : ""}`} onClick={listenForDestination}>
@@ -299,6 +341,19 @@ function DemoView({ snapshot, refresh }: { snapshot: Snapshot; refresh: (snapsho
     refresh(await api.snapshot());
     setStatus("Demo data reset.");
   }
+  async function say(transcript: string) {
+    if (!trip) {
+      setStatus("Start a trip from Rider or Play Judge Demo first.");
+      return;
+    }
+    const result = await api.replyToTrip(trip.id, transcript);
+    refresh(await api.snapshot());
+    setStatus(`Rider said "${transcript}" → ${result.interpretation.intent}.`);
+  }
+  async function setLanguage(language: string) {
+    await api.setLanguage(language);
+    refresh(await api.snapshot());
+  }
   return (
     <section className="content">
       <PanelTitle icon={<Play />} title="Judge Demo Controls" />
@@ -310,7 +365,13 @@ function DemoView({ snapshot, refresh }: { snapshot: Snapshot; refresh: (snapsho
           <button className="ghost" onClick={() => run("on-route")}>Run On-Route Demo</button>
           <button className="ghost" onClick={reset}>Reset Demo</button>
         </div>
-        <p className="muted">Keep /rider open. This remote injects GPS, then Tier 1 → 2 → 3 on an 8 second cadence.</p>
+        <p className="muted">Keep /rider open. GPS then Tier 1 → 2 → 3. Switch language without changing the route.</p>
+        <div className="actions">
+          <LanguageToggle current={snapshot.riders[0]?.preferred_language} onChange={setLanguage} />
+          <button className="ghost" onClick={() => say("yes")}>Rider says yes</button>
+          <button className="ghost" onClick={() => say("I'm lost")}>Rider says I'm lost</button>
+          <button className="ghost" onClick={() => say("help")}>Rider says help</button>
+        </div>
       </div>
     </section>
   );
@@ -325,6 +386,7 @@ function TripCard({ trip }: { trip: Trip }) {
       </div>
       <p>{trip.route_name} to {trip.destination_name}</p>
       <p className="muted">{trip.spoken_instruction}</p>
+      {trip.last_reply_intent ? <p className="muted">Rider said: {trip.last_reply_intent.replace("_", " ")}</p> : null}
       <p className="muted">{trip.locations?.length ?? 0} GPS pings received</p>
     </article>
   );
@@ -366,6 +428,16 @@ function EmptyState({ text }: { text: string }) {
   return <div className="card muted">{text}</div>;
 }
 
+function LanguageToggle({ current, onChange }: { current?: string; onChange: (language: string) => void }) {
+  const active = current?.toLowerCase().startsWith("vi") ? "vi" : "en";
+  return (
+    <div className="lang-toggle">
+      <button className={active === "en" ? "primary" : "ghost"} onClick={() => onChange("en")}>EN</button>
+      <button className={active === "vi" ? "primary" : "ghost"} onClick={() => onChange("vi")}>VI</button>
+    </div>
+  );
+}
+
 function permissionLabel(key: string) {
   const labels: Record<string, string> = {
     location: "Location always on: lets Guardian watch the trip.",
@@ -387,12 +459,4 @@ function labelEscort(state?: string) {
 
 function speechLang(code?: string) {
   return code?.toLowerCase().startsWith("vi") ? "vi-VN" : "en-US";
-}
-
-function speak(text: string, lang = "en-US") {
-  if (!("speechSynthesis" in window) || !text) return;
-  window.speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(text);
-  utterance.lang = lang;
-  window.speechSynthesis.speak(utterance);
 }

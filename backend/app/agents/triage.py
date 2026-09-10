@@ -29,6 +29,13 @@ def _fallback_triage(event: dict) -> dict:
             "recommended_action": "Call the rider to confirm they are safe and still waiting intentionally.",
             "rider_phrase": "Please wait. A Guardian volunteer may call you.",
         }
+    if deviation_type == "confused":
+        return {
+            "severity": "mild",
+            "summary": f"{rider_name} said they are lost or confused while traveling to {destination}.",
+            "recommended_action": "Stay on the line if they call, and watch whether they recover after the spoken redirect.",
+            "rider_phrase": "Get off at the next stop and wait.",
+        }
     if deviation_type == "help requested":
         return {
             "severity": "critical",
@@ -43,7 +50,7 @@ def _fallback_triage(event: dict) -> dict:
 
 
 @lru_cache(maxsize=1)
-def _anthropic_client():
+def anthropic_client():
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         return None
@@ -55,7 +62,7 @@ def _anthropic_client():
 
 
 def generate_triage(event: dict) -> dict:
-    client = _anthropic_client()
+    client = anthropic_client()
     if client is None:
         return _fallback_triage(event)
 

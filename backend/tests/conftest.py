@@ -7,6 +7,8 @@ os.environ["GUARDIAN_TIER_HOLD_SECONDS"] = "8"
 os.environ["GUARDIAN_DEMO_PING_SECONDS"] = "0"
 os.environ["GUARDIAN_DEMO_SYNC"] = "1"
 os.environ["GUARDIAN_AUTO_ESCALATE"] = "0"
+os.environ["GUARDIAN_USE_LLM"] = "0"
+os.environ["GUARDIAN_TTS"] = "0"
 
 import pytest
 from fastapi.testclient import TestClient

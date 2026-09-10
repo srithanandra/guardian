@@ -142,6 +142,7 @@ def ensure_columns(conn: sqlite3.Connection) -> None:
         ("trips", trip_columns, "escort_state", "TEXT NOT NULL DEFAULT 'on_track'"),
         ("trips", trip_columns, "spoken_instruction", "TEXT NOT NULL DEFAULT ''"),
         ("trips", trip_columns, "companion_notified", "INTEGER NOT NULL DEFAULT 0"),
+        ("trips", trip_columns, "last_reply_intent", "TEXT NOT NULL DEFAULT ''"),
     ]
     for table, existing, name, spec in additions:
         if name not in existing:
@@ -207,6 +208,7 @@ def hydrate_trip(row: dict) -> dict:
     row["companion_notified"] = bool(row.get("companion_notified"))
     row["escort_state"] = row.get("escort_state") or "on_track"
     row["spoken_instruction"] = row.get("spoken_instruction") or ""
+    row["last_reply_intent"] = row.get("last_reply_intent") or ""
     return row
 
 

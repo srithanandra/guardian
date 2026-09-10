@@ -169,7 +169,30 @@ input {
 .help-button {
   background: #dc2626;
   font-size: 1.8rem;
-  height: 240px;
+  height: 200px;
+}
+
+.answer-button {
+  background: #1d4ed8;
+  color: white;
+  font-size: 1.05rem;
+  justify-content: center;
+  min-height: 72px;
+  width: 100%;
+}
+
+.answer-button.emphasis {
+  background: #0f766e;
+}
+
+.lang-toggle {
+  display: flex;
+  gap: 8px;
+}
+
+.lang-toggle button {
+  min-width: 52px;
+  padding: 8px 12px;
 }
 
 .escort-card {

@@ -44,6 +44,7 @@ export interface Trip {
   escort_state?: string;
   spoken_instruction?: string;
   companion_notified?: boolean;
+  last_reply_intent?: string;
   route_shape: [number, number][];
   milestones: { label: string; complete: boolean }[];
   locations?: { lat: number; lon: number; source: string; recorded_at: string }[];
@@ -101,6 +102,13 @@ export const api = {
   claimAlert: (alertId: string) => request<Alert>(`/alerts/${alertId}/claim`, { method: "POST" }),
   escalateAlert: (alertId: string) => request<Alert>(`/alerts/${alertId}/escalate`, { method: "POST" }),
   requestHelp: (tripId: string) => request<Trip>(`/trips/${tripId}/help`, { method: "POST" }),
+  replyToTrip: (tripId: string, transcript: string) =>
+    request<{ trip: Trip; interpretation: { intent: string; transcript: string } }>(`/trips/${tripId}/reply`, {
+      method: "POST",
+      body: JSON.stringify({ transcript }),
+    }),
+  setLanguage: (language: string) =>
+    request(`/riders/rider_nguyen/language`, { method: "PATCH", body: JSON.stringify({ preferred_language: language }) }),
   runDemo: (scenario: string) => request<Trip>(`/demo/run/${scenario}`, { method: "POST" }),
   resetDemo: () => request("/demo/reset", { method: "POST" }),
 };
