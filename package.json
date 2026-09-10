@@ -1,0 +1,16 @@
+{
+  "name": "guardian",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Guardian hackathon MVP: AI-powered transit supervision for vulnerable riders.",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:backend": "python -m uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "test": "python -m pytest backend/tests",
+    "build": "npm --prefix frontend run build"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

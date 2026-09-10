@@ -1,0 +1,9 @@
+{
+  "name": "Guardian Transit Supervision",
+  "short_name": "Guardian",
+  "start_url": "/rider",
+  "display": "standalone",
+  "background_color": "#f8fafc",
+  "theme_color": "#0f172a",
+  "description": "AI-powered transit supervision for vulnerable riders."
+}
